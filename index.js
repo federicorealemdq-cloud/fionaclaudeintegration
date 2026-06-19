@@ -143,6 +143,7 @@ function buildServer() {
 // Responden 200 OK; no almacenamos datos de clientes en este servidor.
 // ---------------------------------------------------------------------------
 const app = express();
+app.set("trust proxy", true); // Railway termina TLS en su proxy; esto hace que req.protocol sea "https"
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
