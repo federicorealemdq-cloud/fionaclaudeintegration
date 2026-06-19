@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -143,6 +144,7 @@ function buildServer() {
 // ---------------------------------------------------------------------------
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 app.post("/webhooks/store-redact", (req, res) => res.sendStatus(200));
 app.post("/webhooks/customer-redact", (req, res) => res.sendStatus(200));
@@ -152,9 +154,112 @@ app.post("/webhooks/customer-data-request", (req, res) => res.sendStatus(200));
 app.get("/", (req, res) => res.send("Tiendanube MCP server OK"));
 
 // ---------------------------------------------------------------------------
-// Endpoint MCP (modo stateless: una transport nueva por request)
+// "OAuth de cortesía": Cowork siempre intenta un login OAuth al conectar un
+// conector personalizado, aunque el servidor no lo necesite. Como este
+// servidor es de uso personal (la autenticación real con Tiendanube ya está
+// embebida server-side via TIENDANUBE_ACCESS_TOKEN), este flujo auto-aprueba
+// todo sin pedir login: solo existe para satisfacer el protocolo OAuth/DCR
+// que el cliente espera.
 // ---------------------------------------------------------------------------
-app.post("/mcp", async (req, res) => {
+function baseUrl(req) {
+  return `${req.protocol}://${req.get("host")}`;
+}
+
+const registeredClients = new Map(); // client_id -> metadata
+const authCodes = new Map(); // code -> { redirect_uri, expires }
+const accessTokens = new Set(); // tokens válidos emitidos por este servidor
+
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  const b = baseUrl(req);
+  res.json({
+    issuer: b,
+    authorization_endpoint: `${b}/oauth/authorize`,
+    token_endpoint: `${b}/oauth/token`,
+    registration_endpoint: `${b}/oauth/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    code_challenge_methods_supported: ["S256", "plain"],
+    token_endpoint_auth_methods_supported: ["none"],
+  });
+});
+
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  const b = baseUrl(req);
+  res.json({
+    resource: `${b}/mcp`,
+    authorization_servers: [b],
+  });
+});
+
+// Dynamic Client Registration (RFC 7591) — acepta cualquier cliente
+app.post("/oauth/register", (req, res) => {
+  const client_id = crypto.randomUUID();
+  const metadata = {
+    client_id,
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    redirect_uris: req.body?.redirect_uris || [],
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code"],
+    response_types: ["code"],
+    ...req.body,
+    client_id, // aseguramos que no se pisotee
+  };
+  registeredClients.set(client_id, metadata);
+  res.status(201).json(metadata);
+});
+
+// Auto-aprueba: no hay pantalla de login, redirige directo con un code
+app.get("/oauth/authorize", (req, res) => {
+  const { redirect_uri, state } = req.query;
+  if (!redirect_uri) {
+    return res.status(400).send("Falta redirect_uri");
+  }
+  const code = crypto.randomUUID();
+  authCodes.set(code, { redirect_uri, expires: Date.now() + 5 * 60 * 1000 });
+
+  const redirect = new URL(redirect_uri);
+  redirect.searchParams.set("code", code);
+  if (state) redirect.searchParams.set("state", state);
+  res.redirect(302, redirect.toString());
+});
+
+// Intercambio de code por access_token
+app.post("/oauth/token", (req, res) => {
+  const { code } = req.body || {};
+  const entry = authCodes.get(code);
+  if (!entry || entry.expires < Date.now()) {
+    return res.status(400).json({ error: "invalid_grant" });
+  }
+  authCodes.delete(code);
+
+  const access_token = crypto.randomUUID();
+  accessTokens.add(access_token);
+
+  res.json({
+    access_token,
+    token_type: "bearer",
+    expires_in: 31536000, // 1 año
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Endpoint MCP (modo stateless: una transport nueva por request)
+// Protegido por el token emitido en el flujo OAuth de arriba.
+// ---------------------------------------------------------------------------
+function requireAuth(req, res, next) {
+  const authHeader = req.get("authorization") || "";
+  const token = authHeader.replace(/^Bearer\s+/i, "");
+  if (!token || !accessTokens.has(token)) {
+    res
+      .status(401)
+      .set("WWW-Authenticate", `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`)
+      .json({ error: "unauthorized" });
+    return;
+  }
+  next();
+}
+
+app.post("/mcp", requireAuth, async (req, res) => {
   try {
     const server = buildServer();
     const transport = new StreamableHTTPServerTransport({
@@ -181,14 +286,14 @@ app.post("/mcp", async (req, res) => {
 // En modo stateless no usamos sesiones, así que GET/DELETE no aplican,
 // pero respondemos explícitamente (en vez de dejar que Express tire 404)
 // porque algunos clientes MCP los prueban antes de usar POST.
-app.get("/mcp", (req, res) => {
+app.get("/mcp", requireAuth, (req, res) => {
   res.status(405).json({
     jsonrpc: "2.0",
     error: { code: -32000, message: "Method not allowed. This server only supports POST for /mcp." },
     id: null,
   });
 });
-app.delete("/mcp", (req, res) => res.status(200).end());
+app.delete("/mcp", requireAuth, (req, res) => res.status(200).end());
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
