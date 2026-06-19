@@ -178,6 +178,18 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
+// En modo stateless no usamos sesiones, así que GET/DELETE no aplican,
+// pero respondemos explícitamente (en vez de dejar que Express tire 404)
+// porque algunos clientes MCP los prueban antes de usar POST.
+app.get("/mcp", (req, res) => {
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method not allowed. This server only supports POST for /mcp." },
+    id: null,
+  });
+});
+app.delete("/mcp", (req, res) => res.status(200).end());
+
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Tiendanube MCP server escuchando en puerto ${PORT}`);
